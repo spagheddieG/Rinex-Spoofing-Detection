@@ -61,9 +61,18 @@ def extract_satellite_timeseries(indexed_records: Dict[str, Any]) -> Dict[str, L
         if not isinstance(satellites, dict):
             continue
         for sat, payload in satellites.items():
-            values = payload.get("values")
-            if not isinstance(values, dict):
-                continue
+            # Try to get values from measurements array first (newer format)
+            measurements = payload.get("measurements", [])
+            if measurements and isinstance(measurements, list) and len(measurements) > 0:
+                # Use the first measurement's values
+                values = measurements[0].get("values")
+                if not isinstance(values, dict):
+                    continue
+            else:
+                # Fall back to direct values key (older format)
+                values = payload.get("values")
+                if not isinstance(values, dict):
+                    continue
             record = EpochRecord(epoch=epoch_dt, values=values)
             series.setdefault(sat, []).append(record)
 
