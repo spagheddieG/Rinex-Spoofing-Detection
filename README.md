@@ -35,3 +35,25 @@ The output JSON contains:
 
 Example conversion results for the sample files in this repository are stored in `/tmp/brdc0010.json` and `/tmp/algo0010.json` after running the above commands locally.
 
+## Spoofing Detection
+
+```bash
+python spoof_detection.py brdc0010.json --output findings.json
+```
+
+The detector analyses the `indexed_records` section and raises findings when:
+
+- Broadcast parameters change without a matching `IODE`/`IODC` update.
+- Navigation data persists longer than the configured interval (default 2 hours).
+- `IODE`/`IODC` values regress while parameters change (suggesting replay or malformed uploads).
+
+Use `--tolerance` to relax numeric comparisons, `--max-interval-hours` to alter the staleness window, and `--ignore-satellites` to skip known-problematic PRNs. When `--output` is provided, the findings are saved as JSON; otherwise a concise summary is printed to the terminal.
+
+## Combining Navigation Files
+
+```bash
+python combine_nav.py data/ -o combined_nav.json --pretty
+```
+
+The combiner ingests every RINEX navigation file found in the supplied paths, keeps the most recent message when duplicate epochs are present, and writes a single JSON in the same format as the per-file converter. Pass `--per-source` to retain each file on its own `source` dimension—useful for high-rate captures where multiple uploads share the same epoch. Source file paths are stored under `attributes.sources` in the output.
+

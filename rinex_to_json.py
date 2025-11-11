@@ -16,10 +16,10 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, MutableMapping, Optional
 
-import georinex as gr
 import numpy as np
 import xarray as xr
 
+from rinex_loader import load_rinex_dataset
 try:  # pandas is an optional dependency but normally present with GeoRinex
     import pandas as pd
 except ModuleNotFoundError:  # pragma: no cover - pandas ships with GeoRinex
@@ -276,7 +276,7 @@ def parse_rinex(path: Path) -> Dict[str, Any]:
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=FutureWarning, module="georinex")
         warnings.filterwarnings("ignore", category=FutureWarning, module="xarray")
-        dataset = gr.load(path)
+        dataset = load_rinex_dataset(path)
 
     return dataset_to_json(dataset, path)
 
