@@ -15,6 +15,7 @@ class EpochRecord:
 
     epoch: datetime
     values: Dict[str, Any]
+    source: Optional[str] = None
 
     @property
     def iode(self) -> Optional[int]:
@@ -61,22 +62,68 @@ def extract_satellite_timeseries(indexed_records: Dict[str, Any]) -> Dict[str, L
         if not isinstance(satellites, dict):
             continue
         for sat, payload in satellites.items():
-            # Try to get values from measurements array first (newer format)
+            # Handle multi-dimensional data (e.g., with source dimension)
             measurements = payload.get("measurements", [])
-            if measurements and isinstance(measurements, list) and len(measurements) > 0:
-                # Use the first measurement's values
-                values = measurements[0].get("values")
-                if not isinstance(values, dict):
-                    continue
+            if measurements and isinstance(measurements, list):
+                # Multi-source data - process each measurement
+                for measurement in measurements:
+                    indices = measurement.get("indices", {})
+                    source = indices.get("source")
+                    values = measurement.get("values", {})
+                    if isinstance(values, dict):
+                        record = EpochRecord(epoch=epoch_dt, values=values, source=source)
+                        series.setdefault(sat, []).append(record)
             else:
-                # Fall back to direct values key (older format)
+                # Single source data - fall back to direct values key
                 values = payload.get("values")
                 if not isinstance(values, dict):
                     continue
-            record = EpochRecord(epoch=epoch_dt, values=values)
-            series.setdefault(sat, []).append(record)
+                record = EpochRecord(epoch=epoch_dt, values=values)
+                series.setdefault(sat, []).append(record)
 
     # ensure per-satellite records sorted by epoch
+    for sat in series:
+        series[sat].sort(key=lambda record: record.epoch)
+
+    return series
+
+
+def extract_satellite_timeseries_multisource(data: Dict[str, Any]) -> Dict[str, List[EpochRecord]]:
+    """Build per-satellite time series from multi-source JSON structure (like tst.json)."""
+    series: Dict[str, List[EpochRecord]] = {}
+
+    # Check if this is multi-source format
+    top_keys = list(data.keys())
+    if not top_keys or not any(key.endswith(('.25n', '.25o', '.n', '.o')) for key in top_keys[:5]):
+        # Not multi-source, fall back to regular extraction
+        if 'indexed_records' in data:
+            return extract_satellite_timeseries(data['indexed_records'])
+        else:
+            return {}
+
+    # Process each source file
+    for source_filename, source_data in data.items():
+        if not isinstance(source_data, dict) or 'indexed_records' not in source_data:
+            continue
+
+        source_indexed = source_data['indexed_records']
+        source_by_time = source_indexed.get('by_time', {})
+
+        for epoch_str, entry in source_by_time.items():
+            epoch_dt = _parse_epoch(epoch_str)
+            satellites = entry.get("satellites", {})
+            if not isinstance(satellites, dict):
+                continue
+
+            for sat, payload in satellites.items():
+                values = payload.get("values")
+                if not isinstance(values, dict):
+                    continue
+
+                record = EpochRecord(epoch=epoch_dt, values=values, source=source_filename)
+                series.setdefault(sat, []).append(record)
+
+    # Ensure per-satellite records sorted by epoch
     for sat in series:
         series[sat].sort(key=lambda record: record.epoch)
 
@@ -99,7 +146,9 @@ def detect_parameter_change_without_iode_change(
         same_iode = prev.iode == record.iode
         same_iodc = prev.iodc == record.iodc
         if same_iode and same_iodc:
-            changed_fields = _diff_values(prev.values, record.values, tolerance, ignore={"IODE", "IODC"})
+            changed_fields = _diff_values(
+                prev.values, record.values, tolerance, ignore={"IODE", "IODC"}
+            )
             if changed_fields:
                 findings.append(
                     Finding(
@@ -107,7 +156,10 @@ def detect_parameter_change_without_iode_change(
                         epoch=record.epoch,
                         code="param_change_without_iode",
                         description="Navigation parameters changed without IODE/IODC update.",
-                        details={"fields": changed_fields, "previous_epoch": prev.epoch.isoformat()},
+                        details={
+                            "fields": changed_fields,
+                            "previous_epoch": prev.epoch.isoformat(),
+                        },
                         discovered_at=record.epoch,
                     )
                 )
@@ -142,7 +194,8 @@ def detect_stale_data(
                 # Check if there are missing entries between prev and current
                 has_gaps = False
                 if by_time:
-                    # Check if there are epochs between prev and current where satellite doesn't appear
+                    # Check if there are epochs between prev and current where
+                    # satellite doesn't appear
                     # This indicates a gap (satellite didn't broadcast) rather than stale data
                     for epoch_str, entry in by_time.items():
                         epoch_dt = _parse_epoch(epoch_str)
@@ -161,7 +214,9 @@ def detect_stale_data(
                             satellite=satellite,
                             epoch=record.epoch,
                             code="stale_data",
-                            description=f"Data unchanged for {delta.total_seconds()/3600:.1f} hours.",
+                            description=(
+                                f"Data unchanged for {delta.total_seconds()/3600:.1f} hours."
+                            ),
                             details={
                                 "elapsed_seconds": delta.total_seconds(),
                                 "previous_epoch": prev.epoch.isoformat(),
@@ -276,7 +331,9 @@ def _iod_jump_warning(previous: Optional[int], current: Optional[int], field: st
     return f"{field} wrapped backwards from {previous} to {current}."
 
 
-def _detect_regression(previous: EpochRecord, current: EpochRecord, satellite: str) -> List[Finding]:
+def _detect_regression(
+    previous: EpochRecord, current: EpochRecord, satellite: str
+) -> List[Finding]:
     """Create findings when parameters change while IODE/IODC regress."""
     findings: List[Finding] = []
 
@@ -316,6 +373,90 @@ def _detect_regression(previous: EpochRecord, current: EpochRecord, satellite: s
             discovered_at=current.epoch,
         )
     )
+    return findings
+
+
+def detect_redundancy_inconsistencies(
+    records: Iterable[EpochRecord],
+    satellite: str,
+    tolerance: float = 0.0,
+) -> List[Finding]:
+    """Detect spoofing by checking for parameter inconsistencies between multiple sources claiming the same broadcast timestamp."""
+    findings: List[Finding] = []
+
+    # Group records by epoch to find multiple sources per timestamp
+    epoch_groups: Dict[datetime, List[EpochRecord]] = {}
+    for record in records:
+        epoch_groups.setdefault(record.epoch, []).append(record)
+
+    # Check each epoch that has multiple sources
+    for epoch, epoch_records in epoch_groups.items():
+        if len(epoch_records) < 2:
+            continue  # Need at least 2 sources to check consistency
+
+        # Group by source if available, otherwise treat all as separate measurements
+        source_groups: Dict[Optional[str], List[EpochRecord]] = {}
+        for record in epoch_records:
+            source = record.source
+            source_groups.setdefault(source, []).append(record)
+
+        # If we have multiple sources for the same epoch, check consistency
+        if len(source_groups) > 1:
+            # Compare parameters across sources
+            reference_record = epoch_records[0]
+            reference_values = reference_record.values
+
+            key_params = ['SVclockBias', 'SVclockDrift', 'SVclockDriftRate', 'IODE', 'IODC', 'Crs', 'Crc']
+
+            for source, source_records in source_groups.items():
+                if source == reference_record.source:
+                    continue  # Skip comparing reference to itself
+
+                for source_record in source_records:
+                    inconsistent_params = []
+                    for param in key_params:
+                        ref_value = reference_values.get(param)
+                        src_value = source_record.values.get(param)
+
+                        # Skip if either value is None
+                        if ref_value is None or src_value is None:
+                            continue
+
+                        # Check for exact equality (or within tolerance for floats)
+                        try:
+                            ref_float = float(ref_value)
+                            src_float = float(src_value)
+                            if abs(ref_float - src_float) > tolerance:
+                                inconsistent_params.append(param)
+                        except (ValueError, TypeError):
+                            # For non-numeric values, check exact equality
+                            if ref_value != src_value:
+                                inconsistent_params.append(param)
+
+                    if inconsistent_params:
+                        findings.append(
+                            Finding(
+                                satellite=satellite,
+                                epoch=epoch,
+                                code="REDUNDANCY_INCONSISTENCY",
+                                description=(
+                                    f"Parameter inconsistency between sources at same broadcast timestamp. "
+                                    f"Inconsistent: {', '.join(inconsistent_params)}. "
+                                    f"Sources: {reference_record.source or 'unknown'} vs {source or 'unknown'}"
+                                ),
+                                details={
+                                    "inconsistent_parameters": inconsistent_params,
+                                    "reference_source": reference_record.source,
+                                    "comparison_source": source,
+                                    "reference_values": {p: reference_values.get(p) for p in inconsistent_params},
+                                    "comparison_values": {p: source_record.values.get(p) for p in inconsistent_params},
+                                    "all_sources": list(source_groups.keys()),
+                                    "total_sources": len(source_groups),
+                                },
+                                discovered_at=datetime.now(),
+                            )
+                        )
+
     return findings
 
 

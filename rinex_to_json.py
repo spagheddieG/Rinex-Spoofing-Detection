@@ -120,7 +120,12 @@ def _row_values_to_dict(row: "pd.Series", data_columns: Iterable[str]) -> Dict[s
     return values
 
 
-def _build_records(dataset: xr.Dataset) -> Optional[Dict[str, Any]]:
+def _build_records(dataset: xr.Dataset, file_header_time: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Build flattened and indexed records for efficient querying.
+    
+    For navigation files, if file_header_time is provided, it will be used as the 
+    primary timestamp for indexing (capture time) instead of TOC (broadcast time).
+    """
     if pd is None or not dataset.data_vars:
         return None
 
@@ -145,7 +150,9 @@ def _build_records(dataset: xr.Dataset) -> Optional[Dict[str, Any]]:
 
     for dim in dims:
         dim_lower = dim.lower()
-        if time_dim is None and any(keyword in dim_lower for keyword in ("time", "epoch", "datetime", "tow")):
+        if time_dim is None and any(
+            keyword in dim_lower for keyword in ("time", "epoch", "datetime", "tow")
+        ):
             time_dim = dim
         if satellite_dim is None and dim_lower in {"sv", "sat", "satellite", "prn"}:
             satellite_dim = dim
@@ -169,7 +176,9 @@ def _build_records(dataset: xr.Dataset) -> Optional[Dict[str, Any]]:
             container[key] = entry
         return entry
 
-    def store_measurement(entry: Dict[str, Any], values: Dict[str, Any], indices: Dict[str, Any]) -> None:
+    def store_measurement(
+        entry: Dict[str, Any], values: Dict[str, Any], indices: Dict[str, Any]
+    ) -> None:
         clean_indices = {k: v for k, v in indices.items() if v is not None}
         if clean_indices:
             entry.setdefault("measurements", []).append(
@@ -194,10 +203,21 @@ def _build_records(dataset: xr.Dataset) -> Optional[Dict[str, Any]]:
         epoch_key = _convert_scalar(row[time_dim]) if time_dim else None
         satellite_key = _convert_scalar(row[satellite_dim]) if satellite_dim else None
 
-        if isinstance(epoch_key, (datetime, date)):
-            epoch_key = epoch_key.isoformat()
-
-        epoch_str = str(epoch_key) if epoch_key is not None else "unknown_epoch"
+        # For navigation files with header time, use that as the primary timestamp
+        # Store the TOC (broadcast time) in the values
+        if file_header_time and epoch_key is not None:
+            # Store the original TOC in the values
+            if isinstance(epoch_key, (datetime, date)):
+                values["TOC"] = epoch_key.isoformat()
+            else:
+                values["TOC"] = str(epoch_key)
+            # Use file header time as the primary indexing key
+            epoch_str = file_header_time
+        else:
+            # Standard behavior: use the epoch from the data
+            if isinstance(epoch_key, (datetime, date)):
+                epoch_key = epoch_key.isoformat()
+            epoch_str = str(epoch_key) if epoch_key is not None else "unknown_epoch"
         satellite_str = str(satellite_key) if satellite_key is not None else "unknown_sv"
 
         const_prefix = "UNKNOWN"
@@ -254,9 +274,20 @@ def _build_records(dataset: xr.Dataset) -> Optional[Dict[str, Any]]:
 
 def dataset_to_json(dataset: xr.Dataset, source: Path) -> Dict[str, Any]:
     """Convert an xarray.Dataset to a JSON-friendly dictionary."""
+    # Extract file header timestamp for navigation files
+    file_header_time = None
+    rinex_type = dataset.attrs.get("rinextype")
+    if rinex_type == "nav":
+        from rinex_loader import _extract_file_time_from_header
+        header_tuple = _extract_file_time_from_header(source)
+        if header_tuple:
+            year, month, day, hour, minute, second = header_tuple
+            file_header_time = datetime(year, month, day, hour, minute, second).isoformat()
+    
     return {
         "source": str(source),
-        "rinex_type": dataset.attrs.get("rinextype"),
+        "rinex_type": rinex_type,
+        "file_header_time": file_header_time,
         "dimensions": {str(dim): int(size) for dim, size in dataset.sizes.items()},
         "coordinates": _coordinates_to_json(dataset.coords),
         "data_variables": {
@@ -264,7 +295,7 @@ def dataset_to_json(dataset: xr.Dataset, source: Path) -> Dict[str, Any]:
             for name, data_array in dataset.data_vars.items()
         },
         "attributes": _clean_attrs(dataset.attrs),
-        "indexed_records": _build_records(dataset),
+        "indexed_records": _build_records(dataset, file_header_time=file_header_time),
     }
 
 
@@ -302,7 +333,10 @@ def cli(argv: Iterable[str] | None = None) -> int:
     parser.add_argument(
         "-o",
         "--output",
-        help="Optional output JSON file. When multiple inputs are supplied, the JSON will map filenames to their parsed content.",
+        help=(
+            "Optional output JSON file. When multiple inputs are supplied, the JSON will map "
+            "filenames to their parsed content."
+        ),
     )
     parser.add_argument(
         "--pretty",

@@ -21,8 +21,15 @@ try:
     import numpy as np  # type: ignore[import]
 except ModuleNotFoundError as exc:  # pragma: no cover - runtime guard
     raise SystemExit(
-        "matplotlib and numpy are required for visualize_nav.py. Install them with `pip install matplotlib numpy`."
+        "matplotlib and numpy are required for visualize_nav.py. "
+        "Install them with `pip install matplotlib numpy`."
     ) from exc
+
+# Import spoof_utils for multi-source data handling
+import sys
+import os
+sys.path.append(os.path.dirname(__file__))
+from spoof_utils import extract_satellite_timeseries_multisource
 
 
 def parse_top_argument(value: str) -> int | str:
@@ -62,12 +69,17 @@ def parse_arguments() -> argparse.Namespace:
         "--top",
         type=parse_top_argument,
         default=5,
-        help="When satellites are not provided, plot the top-N satellites with the most data points, or 'all' to plot all satellites (default: 5).",
+        help=(
+            "When satellites are not provided, plot the top-N satellites with the most data points, "
+            "or 'all' to plot all satellites (default: 5)."
+        ),
     )
     parser.add_argument(
         "--output",
         type=Path,
-        help="Optional path to save the figure. When omitted the plot window is shown interactively.",
+        help=(
+            "Optional path to save the figure. When omitted the plot window is shown interactively."
+        ),
     )
     parser.add_argument(
         "--source",
@@ -181,25 +193,25 @@ def plot_series(
             ]
             if intervals:
                 median_interval = sorted(intervals)[len(intervals) // 2]
-                # Gap threshold: 3x the median interval or 1 hour, whichever is larger
-                gap_threshold = max(median_interval * 3, 3600)  # 3600 seconds = 1 hour
-                
+                # Gap threshold: 2x the median interval or 30 minutes, whichever is larger
+                gap_threshold = max(median_interval * 2, 1800)  # 1800 seconds = 30 minutes
+
                 # Convert datetimes to numeric values for gap handling
                 times_numeric = mdates.date2num(times)
-                
+
                 # Insert NaN values where gaps are detected
                 times_with_gaps = []
                 values_with_gaps = []
                 for i in range(len(times_numeric)):
                     if i > 0:
-                        gap = (times[i] - times[i-1]).total_seconds()
-                        if gap > gap_threshold:
-                            # Insert NaN to break the line
+                        time_gap = (times[i] - times[i-1]).total_seconds()
+                        if time_gap > gap_threshold:
+                            # Insert NaN to break the line for time gaps
                             times_with_gaps.append(np.nan)
                             values_with_gaps.append(np.nan)
                     times_with_gaps.append(times_numeric[i])
                     values_with_gaps.append(values[i])
-                
+
                 times = times_with_gaps
                 values = values_with_gaps
             else:
@@ -209,7 +221,9 @@ def plot_series(
             # Convert to numeric for single point
             times = mdates.date2num(times)
         
-        plt.plot(times, values, marker="o", markersize=3, label=sat)
+        # Only plot if we have valid data points (not all NaN)
+        if any(not np.isnan(v) for v in values):
+            plt.plot(times, values, marker="o", markersize=3, label=sat)
 
     # Format x-axis as dates (set once after all plots)
     plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
@@ -235,15 +249,55 @@ def main() -> int:
     args = parse_arguments()
     data = load_nav_json(args.json_path)
 
+    # Handle both single-source and multi-source combined JSON files
     indexed = data.get("indexed_records")
-    if not indexed or "by_time" not in indexed:
-        raise ValueError(
-            "The provided JSON does not contain the `indexed_records.by_time` structure. "
-            "Make sure it was generated with the updated rinex_to_json.py script."
-        )
+    if indexed and "by_time" in indexed:
+        # Single source file
+        by_time_data = indexed["by_time"]
+    else:
+        # Check if this is a combined file with multiple sources
+        top_keys = list(data.keys())
+        if not top_keys:
+            raise ValueError("JSON file appears to be empty.")
+
+        # Check if top-level keys look like source filenames (end with .25n or similar)
+        if any(key.endswith(('.25n', '.25o', '.n', '.o')) for key in top_keys[:5]):
+            # Multi-source file - create combined by_time with source information
+            by_time_data = {}
+            for source_key, source_data in data.items():
+                source_indexed = source_data.get("indexed_records", {})
+                source_by_time = source_indexed.get("by_time", {})
+
+                # For each epoch in this source, add source information to satellite data
+                for epoch_str, epoch_data in source_by_time.items():
+                    if epoch_str not in by_time_data:
+                        by_time_data[epoch_str] = {"satellites": {}}
+
+                    satellites = epoch_data.get("satellites", {})
+                    for sat, sat_data in satellites.items():
+                        if sat not in by_time_data[epoch_str]["satellites"]:
+                            by_time_data[epoch_str]["satellites"][sat] = {"measurements": []}
+
+                        # Add this source's data as a measurement
+                        measurement = {
+                            "indices": {"source": source_key},
+                            "values": sat_data.get("values", {})
+                        }
+                        by_time_data[epoch_str]["satellites"][sat]["measurements"].append(measurement)
+
+            if not by_time_data:
+                raise ValueError(
+                    "No valid navigation data found in combined JSON file. "
+                    "Make sure the source files were processed correctly."
+                )
+        else:
+            raise ValueError(
+                "The provided JSON does not contain the expected `indexed_records.by_time` structure. "
+                "Make sure it was generated with the updated rinex_to_json.py script."
+            )
 
     series = collect_series(
-        indexed["by_time"],
+        by_time_data,
         metric=args.metric,
         satellites_filter=args.satellites,
         constellation_filter=args.constellation,

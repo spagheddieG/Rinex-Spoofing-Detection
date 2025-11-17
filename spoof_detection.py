@@ -14,7 +14,9 @@ from spoof_utils import (
     detect_parameter_change_without_iode_change,
     detect_stale_data,
     detect_unexpected_iod_changes,
+    detect_redundancy_inconsistencies,
     extract_satellite_timeseries,
+    extract_satellite_timeseries_multisource,
     load_nav_json,
 )
 
@@ -44,7 +46,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--max-interval-hours",
         type=float,
         default=2.0,
-        help="Maximum expected interval between updates before flagging stale data (default: 2 hours).",
+        help=(
+            "Maximum expected interval between updates before flagging stale data (default: 2 hours)."
+        ),
     )
     parser.add_argument(
         "--ignore-satellites",
@@ -57,11 +61,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 def run_detection(args: argparse.Namespace) -> List[Finding]:
     """Run the configured spoofing checks and return findings."""
     data = load_nav_json(args.json_path)
-    indexed = data.get("indexed_records")
-    if not indexed:
-        raise ValueError("JSON file missing 'indexed_records'.")
 
-    timeseries = extract_satellite_timeseries(indexed)
+    # Extract timeseries, handling both single-source and multi-source files
+    timeseries = extract_satellite_timeseries_multisource(data)
+
     findings: List[Finding] = []
     ignore_set = {sat.upper() for sat in (args.ignore_satellites or [])}
 
@@ -81,10 +84,15 @@ def run_detection(args: argparse.Namespace) -> List[Finding]:
                 records,
                 satellite=satellite,
                 max_interval=max_interval,
-                by_time=indexed.get("by_time"),
+                by_time={},  # Not used in multi-source mode
             )
         )
         findings.extend(detect_unexpected_iod_changes(records, satellite=satellite))
+        findings.extend(
+            detect_redundancy_inconsistencies(
+                records, satellite=satellite, tolerance=args.tolerance
+            )
+        )
 
     return findings
 
@@ -99,7 +107,10 @@ def print_summary(findings: List[Finding]) -> None:
     for finding in findings:
         epoch_str = finding.epoch.isoformat(sep=" ")
         discovered_str = finding.discovered_at.isoformat(sep=" ")
-        print(f"- [{finding.code}] {finding.satellite} @ {epoch_str} (discovered at {discovered_str}): {finding.description}")
+        print(
+            f"- [{finding.code}] {finding.satellite} @ {epoch_str} "
+            f"(discovered at {discovered_str}): {finding.description}"
+        )
 
 
 def write_output(path: Path, findings: List[Finding]) -> None:

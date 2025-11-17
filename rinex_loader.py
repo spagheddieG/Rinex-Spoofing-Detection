@@ -55,7 +55,8 @@ def merge_nav_datasets(
                 import pandas as pd
                 
                 if header_time:
-                    # Use header time to determine the date and hour, then add quarter-hour offset from filename
+                    # Use header time to determine the date and hour, then add
+                    # quarter-hour offset from filename
                     year, month, day, hour, minute, second = header_time
                     file_datetime = datetime(year, month, day, hour, minute, second)
                     
@@ -63,7 +64,10 @@ def merge_nav_datasets(
                     # it likely belongs to the previous hour
                     if minute < 10 and offset_minutes == 45:
                         # Roll back one hour
-                        dataset_hour = (file_datetime - timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+                        dataset_hour = (
+                            (file_datetime - timedelta(hours=1))
+                            .replace(minute=0, second=0, microsecond=0)
+                        )
                     else:
                         # Round to the hour, then add quarter-hour offset from filename
                         dataset_hour = file_datetime.replace(minute=0, second=0, microsecond=0)
@@ -142,7 +146,9 @@ def _extract_file_time_from_header(path: Path) -> tuple[int, int, int, int, int,
                     # Try to extract date/time: YYYYMMDD HH:MM:SS
                     import re
                     # Match pattern like "20251110 00:16:17" or "2025 11 10 00:16:17"
-                    match = re.search(r"(\d{4})\s*(\d{2})\s*(\d{2})\s+(\d{2}):(\d{2}):(\d{2})", line)
+                    match = re.search(
+                        r"(\d{4})\s*(\d{2})\s*(\d{2})\s+(\d{2}):(\d{2}):(\d{2})", line
+                    )
                     if match:
                         year, month, day, hour, minute, second = map(int, match.groups())
                         return (year, month, day, hour, minute, second)
