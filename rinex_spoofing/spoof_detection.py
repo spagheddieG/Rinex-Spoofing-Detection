@@ -8,7 +8,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Iterable, List
 
-from spoof_utils import (
+from .spoof_utils import (
     EpochRecord,
     Finding,
     detect_parameter_change_without_iode_change,

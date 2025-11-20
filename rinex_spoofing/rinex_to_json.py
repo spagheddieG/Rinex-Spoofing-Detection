@@ -19,7 +19,7 @@ from typing import Any, Dict, Iterable, MutableMapping, Optional
 import numpy as np
 import xarray as xr
 
-from rinex_loader import load_rinex_dataset
+from .rinex_loader import load_rinex_dataset
 try:  # pandas is an optional dependency but normally present with GeoRinex
     import pandas as pd
 except ModuleNotFoundError:  # pragma: no cover - pandas ships with GeoRinex
@@ -278,7 +278,7 @@ def dataset_to_json(dataset: xr.Dataset, source: Path) -> Dict[str, Any]:
     file_header_time = None
     rinex_type = dataset.attrs.get("rinextype")
     if rinex_type == "nav":
-        from rinex_loader import _extract_file_time_from_header
+        from .rinex_loader import _extract_file_time_from_header
         header_tuple = _extract_file_time_from_header(source)
         if header_tuple:
             year, month, day, hour, minute, second = header_tuple
@@ -345,7 +345,14 @@ def cli(argv: Iterable[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    paths = [Path(p).expanduser().resolve() for p in args.inputs]
+    paths: list[Path] = []
+    for p in args.inputs:
+        path = Path(p).expanduser().resolve()
+        if path.is_dir():
+            # If input is a directory, include all files within it
+            paths.extend([f for f in path.glob("*") if f.is_file()])
+        else:
+            paths.append(path)
     json_obj: Dict[str, Any]
     if len(paths) == 1:
         json_obj = parse_rinex(paths[0])

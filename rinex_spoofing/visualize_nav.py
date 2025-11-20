@@ -26,10 +26,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - runtime guard
     ) from exc
 
 # Import spoof_utils for multi-source data handling
-import sys
-import os
-sys.path.append(os.path.dirname(__file__))
-from spoof_utils import extract_satellite_timeseries_multisource
+from .spoof_utils import extract_satellite_timeseries_multisource
 
 
 def parse_top_argument(value: str) -> int | str:
@@ -104,7 +101,7 @@ def parse_epoch(value: str) -> datetime:
 
 
 def collect_series(
-    by_time: Dict[str, Dict],
+    timeseries: Dict[str, List[EpochRecord]],
     metric: str,
     satellites_filter: Iterable[str] | None,
     constellation_filter: str | None,
@@ -115,43 +112,27 @@ def collect_series(
     source_filter = source_filter.lower() if source_filter else None
 
     series: Dict[str, List[Tuple[datetime, float]]] = defaultdict(list)
-    for epoch_str, entry in sorted(by_time.items()):
-        timestamp = parse_epoch(epoch_str)
-        satellites = entry.get("satellites", {})
-        for sat, payload in satellites.items():
-            sat_upper = sat.upper()
-            if satellites_filter_set and sat_upper not in satellites_filter_set:
-                continue
-            if constellation_filter and not sat_upper.startswith(constellation_filter):
-                continue
+    
+    for sat, records in timeseries.items():
+        sat_upper = sat.upper()
+        if satellites_filter_set and sat_upper not in satellites_filter_set:
+            continue
+        if constellation_filter and not sat_upper.startswith(constellation_filter):
+            continue
 
-            # Handle multi-dimensional data (e.g., with source dimension)
-            measurements = payload.get("measurements", [])
-            if measurements:
-                for measurement in measurements:
-                    indices = measurement.get("indices", {})
-                    if source_filter and indices.get("source", "").lower() != source_filter:
-                        continue
-                    values = measurement.get("values", {})
-                    value = values.get(metric)
-                    if value is None:
-                        continue
-                    try:
-                        numeric_value = float(value)
-                        series[sat_upper].append((timestamp, numeric_value))
-                    except (TypeError, ValueError):
-                        continue
-            else:
-                # Standard 2D data (time, sv)
-                values = payload.get("values") or {}
-                value = values.get(metric)
-                if value is None:
-                    continue
-                try:
-                    numeric_value = float(value)
-                    series[sat_upper].append((timestamp, numeric_value))
-                except (TypeError, ValueError):
-                    continue
+        for record in records:
+            if source_filter and record.source and record.source.lower() != source_filter:
+                continue
+            
+            value = record.values.get(metric)
+            if value is None:
+                continue
+                
+            try:
+                numeric_value = float(value)
+                series[sat_upper].append((record.epoch, numeric_value))
+            except (TypeError, ValueError):
+                continue
 
     return series
 
@@ -249,55 +230,14 @@ def main() -> int:
     args = parse_arguments()
     data = load_nav_json(args.json_path)
 
-    # Handle both single-source and multi-source combined JSON files
-    indexed = data.get("indexed_records")
-    if indexed and "by_time" in indexed:
-        # Single source file
-        by_time_data = indexed["by_time"]
-    else:
-        # Check if this is a combined file with multiple sources
-        top_keys = list(data.keys())
-        if not top_keys:
-            raise ValueError("JSON file appears to be empty.")
-
-        # Check if top-level keys look like source filenames (end with .25n or similar)
-        if any(key.endswith(('.25n', '.25o', '.n', '.o')) for key in top_keys[:5]):
-            # Multi-source file - create combined by_time with source information
-            by_time_data = {}
-            for source_key, source_data in data.items():
-                source_indexed = source_data.get("indexed_records", {})
-                source_by_time = source_indexed.get("by_time", {})
-
-                # For each epoch in this source, add source information to satellite data
-                for epoch_str, epoch_data in source_by_time.items():
-                    if epoch_str not in by_time_data:
-                        by_time_data[epoch_str] = {"satellites": {}}
-
-                    satellites = epoch_data.get("satellites", {})
-                    for sat, sat_data in satellites.items():
-                        if sat not in by_time_data[epoch_str]["satellites"]:
-                            by_time_data[epoch_str]["satellites"][sat] = {"measurements": []}
-
-                        # Add this source's data as a measurement
-                        measurement = {
-                            "indices": {"source": source_key},
-                            "values": sat_data.get("values", {})
-                        }
-                        by_time_data[epoch_str]["satellites"][sat]["measurements"].append(measurement)
-
-            if not by_time_data:
-                raise ValueError(
-                    "No valid navigation data found in combined JSON file. "
-                    "Make sure the source files were processed correctly."
-                )
-        else:
-            raise ValueError(
-                "The provided JSON does not contain the expected `indexed_records.by_time` structure. "
-                "Make sure it was generated with the updated rinex_to_json.py script."
-            )
+    # Use shared logic to extract timeseries
+    timeseries = extract_satellite_timeseries_multisource(data)
+    
+    if not timeseries:
+        raise ValueError("No valid navigation data found in JSON file.")
 
     series = collect_series(
-        by_time_data,
+        timeseries,
         metric=args.metric,
         satellites_filter=args.satellites,
         constellation_filter=args.constellation,
