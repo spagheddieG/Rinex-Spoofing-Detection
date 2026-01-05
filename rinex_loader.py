@@ -50,48 +50,51 @@ def merge_nav_datasets(
             # Try to get file creation time from header
             header_time = _extract_file_time_from_header(path)
             
-            if offset_minutes is not None and len(dataset.time) > 0:
+            # Use header time when available, even if no offset in filename
+            # This ensures highrate files with 15-minute intervals use header time
+            # instead of broadcast time (TOC)
+            if len(dataset.time) > 0:
                 from datetime import datetime, timedelta
                 import pandas as pd
                 
                 if header_time:
-                    # Use header time to determine the date and hour, then add
-                    # quarter-hour offset from filename
+                    # Use header time to determine the date and hour
                     year, month, day, hour, minute, second = header_time
                     file_datetime = datetime(year, month, day, hour, minute, second)
                     
-                    # Handle hour rollover: if header minute is small (< 10) but filename says 45,
-                    # it likely belongs to the previous hour
-                    if minute < 10 and offset_minutes == 45:
-                        # Roll back one hour
-                        dataset_hour = (
-                            (file_datetime - timedelta(hours=1))
-                            .replace(minute=0, second=0, microsecond=0)
-                        )
+                    if offset_minutes is not None:
+                        # Handle hour rollover: if header minute is small (< 10) but filename says 45,
+                        # it likely belongs to the previous hour
+                        if minute < 10 and offset_minutes == 45:
+                            # Roll back one hour
+                            dataset_hour = (
+                                (file_datetime - timedelta(hours=1))
+                                .replace(minute=0, second=0, microsecond=0)
+                            )
+                        else:
+                            # Round to the hour, then add quarter-hour offset from filename
+                            dataset_hour = file_datetime.replace(minute=0, second=0, microsecond=0)
+                        
+                        # Add the quarter-hour offset
+                        offset_timedelta = timedelta(minutes=offset_minutes)
+                        normalized_base = dataset_hour + offset_timedelta
                     else:
-                        # Round to the hour, then add quarter-hour offset from filename
-                        dataset_hour = file_datetime.replace(minute=0, second=0, microsecond=0)
-                else:
-                    # Fallback to TOC-based approach
-                    first_time = pd.to_datetime(dataset.time.values[0])
-                    dataset_hour = first_time.replace(minute=0, second=0, microsecond=0)
-                
-                # Add the quarter-hour offset
-                offset_timedelta = timedelta(minutes=offset_minutes)
-                normalized_base = dataset_hour + offset_timedelta
-                # For high-rate data, normalize ALL timestamps to the exact quarter-hour
-                # This groups all measurements from the same source file together
-                new_times = pd.to_datetime([normalized_base] * len(dataset.time))
-                dataset = dataset.assign_coords(time=new_times.values)
-                
-                # Deduplicate within this dataset: keep latest per (time, sv)
-                # This handles cases where a file has multiple navigation messages
-                df = dataset.to_dataframe().reset_index()
-                value_columns = [col for col in df.columns if col not in {"time", "sv"}]
-                if value_columns:
-                    df = df.dropna(how="all", subset=value_columns)
-                df = df.drop_duplicates(subset=["time", "sv"], keep="last")
-                dataset = df.set_index(["time", "sv"]).to_xarray()
+                        # No offset in filename - use header time directly (rounded to nearest minute)
+                        normalized_base = file_datetime.replace(second=0, microsecond=0)
+                    
+                    # For high-rate data, normalize ALL timestamps to the normalized base time
+                    # This groups all measurements from the same source file together
+                    new_times = pd.to_datetime([normalized_base] * len(dataset.time))
+                    dataset = dataset.assign_coords(time=new_times.values)
+                    
+                    # Deduplicate within this dataset: keep latest per (time, sv)
+                    # This handles cases where a file has multiple navigation messages
+                    df = dataset.to_dataframe().reset_index()
+                    value_columns = [col for col in df.columns if col not in {"time", "sv"}]
+                    if value_columns:
+                        df = df.dropna(how="all", subset=value_columns)
+                    df = df.drop_duplicates(subset=["time", "sv"], keep="last")
+                    dataset = df.set_index(["time", "sv"]).to_xarray()
             
             expanded = dataset.expand_dims({"source": [label]}).assign_coords(source=[label])
             datasets_with_source.append(expanded)

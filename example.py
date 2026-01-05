@@ -9,7 +9,7 @@ This script shows how to:
 
 Requirements:
 - Python 3.12+
-- RINEX navigation files (.25n format) in highrate data/ directory
+- RINEX navigation files (.25n format) in highrate_data/ directory
 - GeoRinex library (pip install georinex)
 - Matplotlib and NumPy for visualization (pip install matplotlib numpy)
 """
@@ -27,11 +27,11 @@ def run_command(command: List[str], description: str) -> None:
 
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=True)
-        print("✓ Success!")
+        print("Success!")
         if result.stdout:
             print(result.stdout)
     except subprocess.CalledProcessError as e:
-        print(f"✗ Failed with exit code {e.returncode}")
+        print(f"Failed with exit code {e.returncode}")
         if e.stdout:
             print("STDOUT:", e.stdout)
         if e.stderr:
@@ -45,17 +45,17 @@ def example_combine_navigation_files():
     print("=" * 50)
 
     # Focus on highrate data as requested
-    highrate_dir = Path("highrate data")
+    highrate_dir = Path("highrate_data")
 
     input_files = []
     if highrate_dir.exists():
         input_files = list(highrate_dir.glob("*.25n"))
     else:
-        print("highrate data/ directory not found.")
+        print("highrate_data/ directory not found.")
         return False
 
     if not input_files:
-        print("No RINEX files found in highrate data/ directory.")
+        print("No RINEX files found in highrate_data/ directory.")
         print("Using existing combined highrate file instead...")
         combined_file = "combined_highrate.json"
         if Path(combined_file).exists():
@@ -70,11 +70,14 @@ def example_combine_navigation_files():
         print(f"  ... and {len(input_files) - 5} more")
 
     # Combine the highrate files
+    # Use --per-source to keep each highrate file as its own entry
+    # This uses header time + quarter-hour offset instead of broadcast time
     output_file = "combined_highrate.json"
     cmd = [
         sys.executable, "combine_nav.py",
         *[str(f) for f in input_files],
         "-o", output_file,
+        "--per-source",
         "--pretty"
     ]
 
@@ -107,7 +110,7 @@ def example_visualize_data(json_file: str):
 
     try:
         run_command(cmd, "Creating Navigation Visualization")
-        print("✓ Plot saved as 'navigation_plot.png'")
+        print("Plot saved as 'navigation_plot.png'")
         return True
     except subprocess.CalledProcessError:
         print("Failed to create visualization. Skipping to next example.")
@@ -138,7 +141,7 @@ def example_spoofing_detection(json_file: str):
         # Check if findings were found
         findings_file = Path("spoofing_findings.json")
         if findings_file.exists():
-            print("✓ Findings saved as 'spoofing_findings.json'")
+            print("Findings saved as 'spoofing_findings.json'")
             # Show a summary of findings
             try:
                 import json
@@ -199,10 +202,17 @@ def main():
     print("=" * 60)
 
     # Check if we're in the right directory
-    if not Path("combine_nav.py").exists():
+    required_files = ["visualize_nav.py", "spoof_detection.py"]
+    missing_files = [f for f in required_files if not Path(f).exists()]
+    if missing_files:
         print("Error: Please run this script from the Rinex Spoofing Detection directory.")
-        print("Expected files: combine_nav.py, visualize_nav.py, spoof_detection.py")
+        print(f"Missing required files: {', '.join(missing_files)}")
         sys.exit(1)
+    
+    # Note: combine_nav.py is optional - if it exists, we'll use it, otherwise skip that step
+    if not Path("combine_nav.py").exists():
+        print("Note: combine_nav.py not found. Will skip file combination step.")
+        print("If you have a combined JSON file, the script will use it instead.\n")
 
     # Example 1: Combine navigation files
     combined_file = example_combine_navigation_files()
