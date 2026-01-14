@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import statistics
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -459,4 +461,674 @@ def detect_redundancy_inconsistencies(
 
     return findings
 
+
+def detect_ephemeris_age_anomalies(
+    records: Iterable[EpochRecord],
+    satellite: str,
+    max_age_hours: float = 4.0,
+) -> List[Finding]:
+    """Detect stale or inconsistent Toe (Time of Ephemeris) values."""
+    findings: List[Finding] = []
+    
+    max_age_seconds = max_age_hours * 3600.0
+    prev_toe: Optional[float] = None
+    
+    for record in records:
+        toe_value = _parse_toe(record.values.get("Toe"))
+        if toe_value is None:
+            continue
+        
+        # Check if Toe is too old relative to capture time
+        # Toe is in seconds-of-week (SOW), not absolute GPS seconds
+        # We need to convert it using GPSWeek: absolute_gps_seconds = (GPSWeek * 604800) + Toe
+        gps_week = _to_int(record.values.get("GPSWeek"))
+        if gps_week is None:
+            # If GPSWeek is missing, we can't calculate absolute time, skip this check
+            continue
+        
+        # Convert Toe from seconds-of-week to absolute GPS seconds
+        seconds_per_week = 604800  # 7 * 24 * 3600
+        toe_absolute_gps_seconds = (gps_week * seconds_per_week) + toe_value
+        
+        # Calculate capture time in absolute GPS seconds
+        gps_epoch = datetime(1980, 1, 6, 0, 0, 0)
+        capture_gps_seconds = (record.epoch - gps_epoch).total_seconds()
+        
+        # Calculate age (how old the ephemeris is)
+        toe_age_seconds = abs(capture_gps_seconds - toe_absolute_gps_seconds)
+        
+        if toe_age_seconds > max_age_seconds:
+            findings.append(
+                Finding(
+                    satellite=satellite,
+                    epoch=record.epoch,
+                    code="ephemeris_age_anomaly",
+                    description=(
+                        f"Ephemeris age {toe_age_seconds/3600:.2f} hours exceeds "
+                        f"maximum {max_age_hours:.1f} hours"
+                    ),
+                    details={
+                        "toe_value": toe_value,
+                        "toe_absolute_gps_seconds": toe_absolute_gps_seconds,
+                        "gps_week": gps_week,
+                        "toe_age_hours": toe_age_seconds / 3600.0,
+                        "max_age_hours": max_age_hours,
+                        "capture_gps_seconds": capture_gps_seconds,
+                    },
+                    discovered_at=record.epoch,
+                )
+            )
+        
+        # Check if Toe regresses (goes backwards)
+        if prev_toe is not None:
+            # Allow small backward change due to wrap-around or minor errors
+            if toe_value < prev_toe - 3600:  # More than 1 hour backward
+                findings.append(
+                    Finding(
+                        satellite=satellite,
+                        epoch=record.epoch,
+                        code="toe_regression",
+                        description=(
+                            f"Toe regressed from {prev_toe:.1f} to {toe_value:.1f} "
+                            f"({prev_toe - toe_value:.1f} seconds backward)"
+                        ),
+                        details={
+                            "previous_toe": prev_toe,
+                            "current_toe": toe_value,
+                            "regression_seconds": prev_toe - toe_value,
+                        },
+                        discovered_at=record.epoch,
+                    )
+                )
+        
+        prev_toe = toe_value
+    
+    return findings
+
+
+def detect_replay_patterns(
+    records: Iterable[EpochRecord],
+    satellite: str,
+    sequence_length: int = 4,
+    parameters: Optional[List[str]] = None,
+) -> List[Finding]:
+    """Detect repeated sequences of parameter values suggesting replay attacks."""
+    findings: List[Finding] = []
+    
+    if parameters is None:
+        parameters = ["SVclockBias", "IODE", "IODC", "Crs", "Crc"]
+    
+    # Convert to list and sort by epoch
+    records_list = list(records)
+    records_list.sort(key=lambda r: r.epoch)
+    
+    if len(records_list) < sequence_length * 2:
+        return findings  # Need at least 2 sequences to detect repetition
+    
+    # Extract sequences for each parameter
+    for param in parameters:
+        sequences: Dict[str, List[int]] = {}  # hash -> list of starting indices
+        
+        for i in range(len(records_list) - sequence_length + 1):
+            sequence_hash = _extract_sequence_hash(
+                records_list[i:i+sequence_length], param, sequence_length
+            )
+            if sequence_hash is None:
+                continue
+            
+            if sequence_hash not in sequences:
+                sequences[sequence_hash] = []
+            sequences[sequence_hash].append(i)
+        
+        # Find repeated sequences (filter out overlapping sequences)
+        for seq_hash, indices in sequences.items():
+            if len(indices) < 2:
+                continue
+            
+            # Filter out overlapping sequences - only consider sequences that are
+            # separated by at least sequence_length positions (non-overlapping)
+            non_overlapping_indices = []
+            for idx in sorted(indices):
+                # Check if this index is far enough from the last non-overlapping one
+                if not non_overlapping_indices or idx >= non_overlapping_indices[-1] + sequence_length:
+                    non_overlapping_indices.append(idx)
+            
+            # Only flag if we have at least 2 non-overlapping occurrences
+            if len(non_overlapping_indices) >= 2:
+                # Calculate time gaps between occurrences to ensure they're separated in time
+                time_gaps = []
+                for i in range(len(non_overlapping_indices) - 1):
+                    idx1 = non_overlapping_indices[i]
+                    idx2 = non_overlapping_indices[i + 1]
+                    # Time gap is from end of first sequence to start of second
+                    time_gap = (records_list[idx2].epoch - records_list[idx1 + sequence_length - 1].epoch).total_seconds()
+                    time_gaps.append(time_gap)
+                
+                # Only flag if sequences are separated by at least 1 hour (3600 seconds)
+                # This ensures we're detecting actual replays, not just overlapping windows
+                min_gap_seconds = 3600.0
+                if any(gap >= min_gap_seconds for gap in time_gaps):
+                    findings.append(
+                        Finding(
+                            satellite=satellite,
+                            epoch=records_list[non_overlapping_indices[-1]].epoch,
+                            code="replay_pattern",
+                            description=(
+                                f"Repeated sequence of {param} values detected "
+                                f"({len(non_overlapping_indices)} non-overlapping occurrences)"
+                            ),
+                            details={
+                                "parameter": param,
+                                "sequence_length": sequence_length,
+                                "occurrence_count": len(non_overlapping_indices),
+                                "occurrence_indices": non_overlapping_indices,
+                                "sequence_hash": seq_hash,
+                                "time_gaps_seconds": time_gaps,
+                            },
+                            discovered_at=records_list[non_overlapping_indices[-1]].epoch,
+                        )
+                    )
+    
+    return findings
+
+
+def detect_temporal_source_inconsistencies(
+    records: Iterable[EpochRecord],
+    satellite: str,
+    time_window: timedelta = timedelta(minutes=30),
+    tolerance: float = 1e-9,
+) -> List[Finding]:
+    """Detect parameter inconsistencies between sources within time windows."""
+    findings: List[Finding] = []
+    
+    records_list = list(records)
+    if len(records_list) < 2:
+        return findings
+    
+    # Group records by time window
+    window_groups = _group_by_time_window(records_list, time_window)
+    
+    key_params = ["SVclockBias", "IODE", "IODC", "Crs", "Crc"]
+    
+    for window_start, window_records in window_groups.items():
+        if len(window_records) < 2:
+            continue
+        
+        # Group by source
+        source_groups: Dict[Optional[str], List[EpochRecord]] = {}
+        for record in window_records:
+            source_groups.setdefault(record.source, []).append(record)
+        
+        if len(source_groups) < 2:
+            continue  # Need multiple sources
+        
+        # Compare parameters across sources in this window
+        sources_list = list(source_groups.keys())
+        reference_source = sources_list[0]
+        reference_records = source_groups[reference_source]
+        
+        if not reference_records:
+            continue
+        
+        reference_record = reference_records[0]
+        
+        for other_source in sources_list[1:]:
+            other_records = source_groups.get(other_source, [])
+            if not other_records:
+                continue
+            
+            for other_record in other_records:
+                inconsistent_params = []
+                for param in key_params:
+                    ref_value = _to_float(reference_record.values.get(param))
+                    other_value = _to_float(other_record.values.get(param))
+                    
+                    if ref_value is None or other_value is None:
+                        continue
+                    
+                    if abs(ref_value - other_value) > tolerance:
+                        inconsistent_params.append(param)
+                
+                if inconsistent_params:
+                    findings.append(
+                        Finding(
+                            satellite=satellite,
+                            epoch=other_record.epoch,
+                            code="temporal_source_inconsistency",
+                            description=(
+                                f"Inconsistent parameters between sources in time window: "
+                                f"{', '.join(inconsistent_params)}"
+                            ),
+                            details={
+                                "inconsistent_parameters": inconsistent_params,
+                                "reference_source": reference_source,
+                                "comparison_source": other_source,
+                                "time_window_start": window_start.isoformat(),
+                                "time_window_size_minutes": time_window.total_seconds() / 60.0,
+                            },
+                            discovered_at=other_record.epoch,
+                        )
+                    )
+    
+    return findings
+
+
+def detect_parameter_velocity_anomalies(
+    records: Iterable[EpochRecord],
+    satellite: str,
+    parameter: str = "SVclockBias",
+    max_acceleration: float = 1e-12,
+) -> List[Finding]:
+    """Detect anomalous acceleration (rate of change of velocity) in parameters."""
+    findings: List[Finding] = []
+    
+    prev: Optional[EpochRecord] = None
+    prev_velocity: Optional[float] = None
+    
+    for record in records:
+        if prev is None:
+            prev = record
+            continue
+        
+        velocity = _calculate_parameter_velocity(prev, record, parameter)
+        if velocity is None:
+            prev = record
+            continue
+        
+        if prev_velocity is not None:
+            time_delta = (record.epoch - prev.epoch).total_seconds()
+            if time_delta > 0:
+                acceleration = (velocity - prev_velocity) / time_delta
+                abs_acceleration = abs(acceleration)
+                
+                if abs_acceleration > max_acceleration:
+                    findings.append(
+                        Finding(
+                            satellite=satellite,
+                            epoch=record.epoch,
+                            code="parameter_acceleration_anomaly",
+                            description=(
+                                f"Parameter {parameter} acceleration {abs_acceleration:.6e} "
+                                f"exceeds maximum {max_acceleration:.6e}"
+                            ),
+                            details={
+                                "parameter": parameter,
+                                "acceleration": acceleration,
+                                "max_acceleration": max_acceleration,
+                                "velocity": velocity,
+                                "previous_velocity": prev_velocity,
+                            },
+                            discovered_at=record.epoch,
+                        )
+                    )
+        
+        prev_velocity = velocity
+        prev = record
+    
+    return findings
+
+
+def detect_cross_satellite_correlations(
+    all_timeseries: Dict[str, List[EpochRecord]],
+    min_correlation: float = 0.9,
+    parameters: Optional[List[str]] = None,
+) -> List[Finding]:
+    """Detect suspicious correlations between satellites (possible coordinated spoofing)."""
+    findings: List[Finding] = []
+    
+    # This is a simplified version - full correlation analysis would be more complex
+    # For now, we'll check if multiple satellites show anomalies at the same time
+    
+    if parameters is None:
+        parameters = ["SVclockBias"]
+    
+    if len(all_timeseries) < 2:
+        return findings
+    
+    # Group records by epoch to find simultaneous anomalies
+    epoch_groups: Dict[datetime, List[Tuple[str, EpochRecord]]] = {}
+    for sat, records in all_timeseries.items():
+        for record in records:
+            epoch_groups.setdefault(record.epoch, []).append((sat, record))
+    
+    # Check each epoch for multiple satellites
+    for epoch, sat_records in epoch_groups.items():
+        if len(sat_records) < 2:
+            continue
+        
+        # For each parameter, check if multiple satellites have similar anomalous values
+        for param in parameters:
+            values: List[Tuple[str, float]] = []
+            for sat, record in sat_records:
+                value = _to_float(record.values.get(param))
+                if value is not None:
+                    values.append((sat, value))
+            
+            if len(values) < 2:
+                continue
+            
+            # Calculate variance - low variance with many satellites suggests correlation
+            value_list = [v for _, v in values]
+            if len(value_list) >= 2:
+                stats = _calculate_statistics(value_list)
+                std = stats["std"]
+                mean = stats["mean"]
+                
+                # Low relative standard deviation with multiple satellites
+                if mean != 0 and len(values) >= 3:
+                    relative_std = abs(std / mean) if mean != 0 else 0.0
+                    if relative_std < 0.01:  # Very low variance
+                        findings.append(
+                            Finding(
+                                satellite="MULTIPLE",
+                                epoch=epoch,
+                                code="cross_satellite_correlation",
+                                description=(
+                                    f"Suspicious correlation in {param} across "
+                                    f"{len(values)} satellites (relative std: {relative_std:.6f})"
+                                ),
+                                details={
+                                    "parameter": param,
+                                    "satellite_count": len(values),
+                                    "relative_std": relative_std,
+                                    "satellites": [sat for sat, _ in values],
+                                },
+                                discovered_at=epoch,
+                            )
+                        )
+    
+    return findings
+
+
+def detect_transmission_time_anomalies(
+    records: Iterable[EpochRecord],
+    satellite: str,
+    max_age_hours: float = 4.0,
+) -> List[Finding]:
+    """Detect stale or inconsistent TransTime (Transmission Time) values."""
+    findings: List[Finding] = []
+    
+    max_age_seconds = max_age_hours * 3600.0
+    prev_transtime: Optional[float] = None
+    
+    for record in records:
+        transtime_value = _parse_transtime(record.values.get("TransTime"))
+        if transtime_value is None:
+            continue
+        
+        # Check if TransTime is too old relative to capture time
+        # TransTime is in seconds-of-week (SOW), not absolute GPS seconds
+        # We need to convert it using GPSWeek: absolute_gps_seconds = (GPSWeek * 604800) + TransTime
+        gps_week = _to_int(record.values.get("GPSWeek"))
+        if gps_week is None:
+            # If GPSWeek is missing, we can't calculate absolute time, skip this check
+            continue
+        
+        # Convert TransTime from seconds-of-week to absolute GPS seconds
+        seconds_per_week = 604800  # 7 * 24 * 3600
+        transtime_absolute_gps_seconds = (gps_week * seconds_per_week) + transtime_value
+        
+        # Calculate capture time in absolute GPS seconds
+        gps_epoch = datetime(1980, 1, 6, 0, 0, 0)
+        capture_gps_seconds = (record.epoch - gps_epoch).total_seconds()
+        
+        # Calculate age (how old the transmission time is)
+        transtime_age_seconds = abs(capture_gps_seconds - transtime_absolute_gps_seconds)
+        
+        if transtime_age_seconds > max_age_seconds:
+            findings.append(
+                Finding(
+                    satellite=satellite,
+                    epoch=record.epoch,
+                    code="transmission_time_anomaly",
+                    description=(
+                        f"TransTime age {transtime_age_seconds/3600:.2f} hours exceeds "
+                        f"maximum {max_age_hours:.1f} hours"
+                    ),
+                    details={
+                        "transtime_value": transtime_value,
+                        "transtime_absolute_gps_seconds": transtime_absolute_gps_seconds,
+                        "gps_week": gps_week,
+                        "transtime_age_hours": transtime_age_seconds / 3600.0,
+                        "max_age_hours": max_age_hours,
+                        "capture_gps_seconds": capture_gps_seconds,
+                    },
+                    discovered_at=record.epoch,
+                )
+            )
+        
+        # Check for regression
+        if prev_transtime is not None:
+            if transtime_value < prev_transtime - 3600:  # More than 1 hour backward
+                findings.append(
+                    Finding(
+                        satellite=satellite,
+                        epoch=record.epoch,
+                        code="transtime_regression",
+                        description=(
+                            f"TransTime regressed from {prev_transtime:.1f} to "
+                            f"{transtime_value:.1f}"
+                        ),
+                        details={
+                            "previous_transtime": prev_transtime,
+                            "current_transtime": transtime_value,
+                            "regression_seconds": prev_transtime - transtime_value,
+                        },
+                        discovered_at=record.epoch,
+                    )
+                )
+        
+        prev_transtime = transtime_value
+    
+    return findings
+
+
+def detect_physics_violations(
+    records: Iterable[EpochRecord],
+    satellite: str,
+    tolerance: float = 1e-6,
+) -> List[Finding]:
+    """Detect violations of physical constraints in orbital parameters."""
+    findings: List[Finding] = []
+    
+    for record in records:
+        # Check eccentricity bounds (should be 0 <= e < 1)
+        eccentricity = _to_float(record.values.get("Eccentricity"))
+        if eccentricity is not None:
+            if eccentricity < 0 or eccentricity >= 1:
+                findings.append(
+                    Finding(
+                        satellite=satellite,
+                        epoch=record.epoch,
+                        code="eccentricity_violation",
+                        description=(
+                            f"Eccentricity {eccentricity:.6e} outside valid range [0, 1)"
+                        ),
+                        details={
+                            "eccentricity": eccentricity,
+                            "valid_range": "[0, 1)",
+                        },
+                        discovered_at=record.epoch,
+                    )
+                )
+        
+        # Check sqrtA (should be positive)
+        sqrtA = _to_float(record.values.get("sqrtA"))
+        if sqrtA is not None:
+            if sqrtA <= 0:
+                findings.append(
+                    Finding(
+                        satellite=satellite,
+                        epoch=record.epoch,
+                        code="sqrtA_violation",
+                        description=f"sqrtA {sqrtA:.6e} is not positive",
+                        details={"sqrtA": sqrtA},
+                        discovered_at=record.epoch,
+                    )
+                )
+        
+        # Check inclination bounds (typically 0 < Io < π)
+        Io = _to_float(record.values.get("Io"))
+        if Io is not None:
+            if Io < 0 or Io > 3.141592653589793 * 2:  # 2π
+                findings.append(
+                    Finding(
+                        satellite=satellite,
+                        epoch=record.epoch,
+                        code="inclination_violation",
+                        description=(
+                            f"Inclination {Io:.6e} outside reasonable range "
+                            f"[0, 2π]"
+                        ),
+                        details={"Io": Io, "valid_range": "[0, 2π]"},
+                        discovered_at=record.epoch,
+                    )
+                )
+        
+        # Check IODE and IODC consistency (should match in most cases)
+        iode = record.iode
+        iodc = record.iodc
+        if iode is not None and iodc is not None:
+            # IODE and IODC should match (IODC has more bits, but lower 8 bits should match IODE)
+            if (iodc & 0xFF) != (iode & 0xFF):
+                findings.append(
+                    Finding(
+                        satellite=satellite,
+                        epoch=record.epoch,
+                        code="iode_iodc_inconsistency",
+                        description=(
+                            f"IODE {iode} and IODC {iodc} lower 8 bits don't match "
+                            f"({iodc & 0xFF} vs {iode & 0xFF})"
+                        ),
+                        details={
+                            "IODE": iode,
+                            "IODC": iodc,
+                            "IODE_lower_8": iode & 0xFF,
+                            "IODC_lower_8": iodc & 0xFF,
+                        },
+                        discovered_at=record.epoch,
+                    )
+                )
+    
+    return findings
+
+
+def _calculate_parameter_velocity(
+    prev_record: EpochRecord,
+    current_record: EpochRecord,
+    parameter: str,
+) -> Optional[float]:
+    """Calculate the rate of change (velocity) of a parameter between two records."""
+    prev_value = prev_record.values.get(parameter)
+    curr_value = current_record.values.get(parameter)
+    
+    if prev_value is None or curr_value is None:
+        return None
+    
+    try:
+        prev_float = float(prev_value)
+        curr_float = float(curr_value)
+        time_delta = (current_record.epoch - prev_record.epoch).total_seconds()
+        
+        if time_delta <= 0:
+            return None
+        
+        velocity = (curr_float - prev_float) / time_delta
+        return velocity
+    except (TypeError, ValueError):
+        return None
+
+
+def _calculate_statistics(
+    values: List[float],
+) -> Dict[str, float]:
+    """Calculate mean and standard deviation of a list of values."""
+    if not values or len(values) < 2:
+        return {"mean": 0.0, "std": 0.0}
+    
+    try:
+        mean = statistics.mean(values)
+        std = statistics.stdev(values) if len(values) > 1 else 0.0
+        return {"mean": mean, "std": std}
+    except (statistics.StatisticsError, ValueError):
+        return {"mean": 0.0, "std": 0.0}
+
+
+def _parse_toe(value: Any) -> Optional[float]:
+    """Extract and parse Toe (Time of Ephemeris) value, returning seconds since GPS epoch start."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_transtime(value: Any) -> Optional[float]:
+    """Extract and parse TransTime (Transmission Time) value, returning seconds since GPS epoch start."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _group_by_time_window(
+    records: List[EpochRecord],
+    window_size: timedelta,
+) -> Dict[datetime, List[EpochRecord]]:
+    """Group records by time windows of specified size."""
+    if not records:
+        return {}
+    
+    groups: Dict[datetime, List[EpochRecord]] = {}
+    
+    # Sort records by epoch
+    sorted_records = sorted(records, key=lambda r: r.epoch)
+    
+    for record in sorted_records:
+        # Calculate window start (truncate to window_size boundary)
+        epoch_seconds = record.epoch.timestamp()
+        window_seconds = window_size.total_seconds()
+        window_start_seconds = int(epoch_seconds / window_seconds) * window_seconds
+        window_start = datetime.fromtimestamp(window_start_seconds)
+        
+        groups.setdefault(window_start, []).append(record)
+    
+    return groups
+
+
+def _extract_sequence_hash(
+    records: List[EpochRecord],
+    parameter: str,
+    sequence_length: int,
+) -> Optional[str]:
+    """Extract a hash of parameter values from a sequence of records."""
+    if len(records) < sequence_length:
+        return None
+    
+    sequence_values = []
+    for record in records[:sequence_length]:
+        value = record.values.get(parameter)
+        if value is None:
+            return None
+        try:
+            sequence_values.append(str(float(value)))
+        except (TypeError, ValueError):
+            return None
+    
+    # Create hash from sequence
+    sequence_str = ",".join(sequence_values)
+    return hashlib.md5(sequence_str.encode()).hexdigest()
+
+
+def _to_float(value: Any) -> Optional[float]:
+    """Safely convert navigation value to float, returning None on failure."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 

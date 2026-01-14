@@ -11,10 +11,17 @@ from typing import Iterable, List
 from spoof_utils import (
     EpochRecord,
     Finding,
+    detect_cross_satellite_correlations,
+    detect_ephemeris_age_anomalies,
     detect_parameter_change_without_iode_change,
-    detect_stale_data,
-    detect_unexpected_iod_changes,
+    detect_parameter_velocity_anomalies,
+    detect_physics_violations,
     detect_redundancy_inconsistencies,
+    detect_replay_patterns,
+    detect_stale_data,
+    detect_temporal_source_inconsistencies,
+    detect_transmission_time_anomalies,
+    detect_unexpected_iod_changes,
     extract_satellite_timeseries,
     extract_satellite_timeseries_multisource,
     load_nav_json,
@@ -55,6 +62,28 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         nargs="+",
         help="Satellite identifiers to skip (e.g. G01 G05).",
     )
+    parser.add_argument(
+        "--max-ephemeris-age-hours",
+        type=float,
+        default=4.0,
+        help="Maximum ephemeris age in hours before flagging (default: 4.0).",
+    )
+    parser.add_argument(
+        "--replay-sequence-length",
+        type=int,
+        default=4,
+        help="Sequence length for replay pattern detection (default: 4).",
+    )
+    parser.add_argument(
+        "--enable-cross-satellite-checks",
+        action="store_true",
+        help="Enable cross-satellite correlation checks.",
+    )
+    parser.add_argument(
+        "--disable-new-detections",
+        action="store_true",
+        help="Disable new highrate detection methods (use only original methods).",
+    )
     return parser.parse_args(argv)
 
 
@@ -74,6 +103,7 @@ def run_detection(args: argparse.Namespace) -> List[Finding]:
         if satellite.upper() in ignore_set:
             continue
 
+        # Original detection methods (always run)
         findings.extend(
             detect_parameter_change_without_iode_change(
                 records, satellite=satellite, tolerance=args.tolerance
@@ -93,6 +123,42 @@ def run_detection(args: argparse.Namespace) -> List[Finding]:
                 records, satellite=satellite, tolerance=args.tolerance
             )
         )
+
+        # New highrate detection methods (if enabled)
+        if not args.disable_new_detections:
+            findings.extend(
+                detect_ephemeris_age_anomalies(
+                    records, satellite=satellite, max_age_hours=args.max_ephemeris_age_hours
+                )
+            )
+            if len(records) >= args.replay_sequence_length * 2:
+                findings.extend(
+                    detect_replay_patterns(
+                        records, satellite=satellite, sequence_length=args.replay_sequence_length
+                    )
+                )
+            findings.extend(
+                detect_temporal_source_inconsistencies(
+                    records, satellite=satellite, time_window=timedelta(minutes=30), tolerance=args.tolerance
+                )
+            )
+            if len(records) >= 3:
+                findings.extend(
+                    detect_parameter_velocity_anomalies(
+                        records, satellite=satellite, parameter="SVclockBias", max_acceleration=1e-12
+                    )
+                )
+            findings.extend(
+                detect_transmission_time_anomalies(
+                    records, satellite=satellite, max_age_hours=args.max_ephemeris_age_hours
+                )
+            )
+            findings.extend(detect_physics_violations(records, satellite=satellite))
+
+    # Cross-satellite correlations (requires all timeseries)
+    if not args.disable_new_detections and args.enable_cross_satellite_checks:
+        cross_satellite_findings = detect_cross_satellite_correlations(timeseries, min_correlation=0.9)
+        findings.extend(cross_satellite_findings)
 
     return findings
 

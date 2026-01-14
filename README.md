@@ -43,11 +43,36 @@ python spoof_detection.py brdc0010.json --output findings.json
 
 The detector analyses the `indexed_records` section and raises findings when:
 
+### Original Detection Methods
+
 - Broadcast parameters change without a matching `IODE`/`IODC` update.
 - Navigation data persists longer than the configured interval (default 2 hours).
 - `IODE`/`IODC` values regress while parameters change (suggesting replay or malformed uploads).
+- Parameter inconsistencies between multiple sources at the same broadcast timestamp.
 
-Use `--tolerance` to relax numeric comparisons, `--max-interval-hours` to alter the staleness window, and `--ignore-satellites` to skip known-problematic PRNs. When `--output` is provided, the findings are saved as JSON; otherwise a concise summary is printed to the terminal.
+### Highrate Detection Methods (New)
+
+Optimized for highrate RINEX data with frequent sampling (e.g., 15-minute intervals):
+
+- **Ephemeris Age Anomalies**: Validates Toe (Time of Ephemeris) freshness and consistency.
+- **Replay Patterns**: Identifies repeated sequences of parameter values suggesting replay attacks.
+- **Temporal Source Inconsistencies**: Detects parameter inconsistencies between multiple sources within time windows.
+- **Parameter Velocity Anomalies**: Validates parameter acceleration (rate of change of velocity) limits.
+- **Transmission Time Anomalies**: Validates TransTime (Transmission Time) freshness and consistency.
+- **Physics Violations**: Validates physical constraints (eccentricity bounds, sqrtA positivity, inclination bounds, IODE/IODC consistency).
+- **Cross-Satellite Correlations**: Detects suspicious correlations between satellites (coordinated spoofing).
+
+### Command-Line Options
+
+Use `--tolerance` to relax numeric comparisons, `--max-interval-hours` to alter the staleness window, and `--ignore-satellites` to skip known-problematic PRNs.
+
+New options for highrate detection:
+- `--max-ephemeris-age-hours`: Maximum ephemeris age before flagging (default: 4.0)
+- `--replay-sequence-length`: Sequence length for replay detection (default: 4)
+- `--enable-cross-satellite-checks`: Enable cross-satellite correlation checks
+- `--disable-new-detections`: Disable new highrate detection methods (use only original methods)
+
+When `--output` is provided, the findings are saved as JSON; otherwise a concise summary is printed to the terminal.
 
 ## Combining Navigation Files
 
@@ -57,3 +82,28 @@ python combine_nav.py data/ -o combined_nav.json --pretty
 
 The combiner ingests every RINEX navigation file found in the supplied paths, keeps the most recent message when duplicate epochs are present, and writes a single JSON in the same format as the per-file converter. Pass `--per-source` to retain each file on its own `source` dimension—useful for high-rate captures where multiple uploads share the same epoch. Source file paths are stored under `attributes.sources` in the output.
 
+## Examples
+
+Individual example scripts demonstrating each detection method are available in the `example/` directory:
+
+- `example_ephemeris_age_anomalies.py`: Ephemeris age validation
+- `example_replay_patterns.py`: Replay pattern detection
+- `example_temporal_source_inconsistencies.py`: Multi-source temporal correlation
+- `example_parameter_velocity_anomalies.py`: Parameter acceleration validation
+- `example_cross_satellite_correlations.py`: Cross-satellite correlation detection
+- `example_transmission_time_anomalies.py`: Transmission time validation
+- `example_physics_violations.py`: Physics constraint validation
+- `example_all_detections.py`: Run all detection methods together
+
+Run any example script:
+```bash
+python example/example_ephemeris_age_anomalies.py
+```
+
+## Testing
+
+Unit tests for all detection methods are available in the `tests/` directory. Run tests using pytest:
+
+```bash
+pytest tests/
+```
