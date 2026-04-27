@@ -10,6 +10,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+GPS_EPOCH = datetime(1980, 1, 6, 0, 0, 0)
+SECONDS_PER_GPS_WEEK = 604800.0
+
 
 @dataclass(frozen=True)
 class EpochRecord:
@@ -472,6 +475,7 @@ def detect_ephemeris_age_anomalies(
     
     max_age_seconds = max_age_hours * 3600.0
     prev_toe: Optional[float] = None
+    prev_toe_absolute_gps_seconds: Optional[float] = None
     
     for record in records:
         toe_value = _parse_toe(record.values.get("Toe"))
@@ -486,16 +490,18 @@ def detect_ephemeris_age_anomalies(
             # If GPSWeek is missing, we can't calculate absolute time, skip this check
             continue
         
-        # Convert Toe from seconds-of-week to absolute GPS seconds
-        seconds_per_week = 604800  # 7 * 24 * 3600
-        toe_absolute_gps_seconds = (gps_week * seconds_per_week) + toe_value
-        
         # Calculate capture time in absolute GPS seconds
-        gps_epoch = datetime(1980, 1, 6, 0, 0, 0)
-        capture_gps_seconds = (record.epoch - gps_epoch).total_seconds()
-        
-        # Calculate age (how old the ephemeris is)
-        toe_age_seconds = abs(capture_gps_seconds - toe_absolute_gps_seconds)
+        capture_gps_seconds = _gps_seconds_for_epoch(record.epoch)
+
+        (
+            toe_absolute_gps_seconds,
+            aligned_week,
+            toe_age_seconds,
+        ) = _resolve_absolute_gps_seconds(
+            sow_value=toe_value,
+            gps_week=gps_week,
+            capture_gps_seconds=capture_gps_seconds,
+        )
         
         if toe_age_seconds > max_age_seconds:
             findings.append(
@@ -511,6 +517,7 @@ def detect_ephemeris_age_anomalies(
                         "toe_value": toe_value,
                         "toe_absolute_gps_seconds": toe_absolute_gps_seconds,
                         "gps_week": gps_week,
+                        "aligned_gps_week": aligned_week,
                         "toe_age_hours": toe_age_seconds / 3600.0,
                         "max_age_hours": max_age_hours,
                         "capture_gps_seconds": capture_gps_seconds,
@@ -520,9 +527,9 @@ def detect_ephemeris_age_anomalies(
             )
         
         # Check if Toe regresses (goes backwards)
-        if prev_toe is not None:
+        if prev_toe_absolute_gps_seconds is not None and prev_toe is not None:
             # Allow small backward change due to wrap-around or minor errors
-            if toe_value < prev_toe - 3600:  # More than 1 hour backward
+            if toe_absolute_gps_seconds < prev_toe_absolute_gps_seconds - 3600:
                 findings.append(
                     Finding(
                         satellite=satellite,
@@ -535,13 +542,18 @@ def detect_ephemeris_age_anomalies(
                         details={
                             "previous_toe": prev_toe,
                             "current_toe": toe_value,
-                            "regression_seconds": prev_toe - toe_value,
+                            "previous_toe_absolute_gps_seconds": prev_toe_absolute_gps_seconds,
+                            "current_toe_absolute_gps_seconds": toe_absolute_gps_seconds,
+                            "regression_seconds": (
+                                prev_toe_absolute_gps_seconds - toe_absolute_gps_seconds
+                            ),
                         },
                         discovered_at=record.epoch,
                     )
                 )
         
         prev_toe = toe_value
+        prev_toe_absolute_gps_seconds = toe_absolute_gps_seconds
     
     return findings
 
@@ -773,7 +785,11 @@ def detect_cross_satellite_correlations(
     min_correlation: float = 0.9,
     parameters: Optional[List[str]] = None,
 ) -> List[Finding]:
-    """Detect suspicious correlations between satellites (possible coordinated spoofing)."""
+    """Detect suspicious cross-satellite similarity (possible coordinated spoofing).
+
+    ``min_correlation`` controls strictness via a relative-variance proxy in [0, 1].
+    Higher values require tighter agreement between satellites.
+    """
     findings: List[Finding] = []
     
     # This is a simplified version - full correlation analysis would be more complex
@@ -784,6 +800,11 @@ def detect_cross_satellite_correlations(
     
     if len(all_timeseries) < 2:
         return findings
+
+    # This detector uses relative standard deviation as a practical correlation proxy.
+    # Preserve previous default sensitivity: min_correlation=0.9 -> max_relative_std=0.01.
+    bounded_min_correlation = max(0.0, min(1.0, float(min_correlation)))
+    max_relative_std = max(1e-6, (1.0 - bounded_min_correlation) / 10.0)
     
     # Group records by epoch to find simultaneous anomalies
     epoch_groups: Dict[datetime, List[Tuple[str, EpochRecord]]] = {}
@@ -817,7 +838,7 @@ def detect_cross_satellite_correlations(
                 # Low relative standard deviation with multiple satellites
                 if mean != 0 and len(values) >= 3:
                     relative_std = abs(std / mean) if mean != 0 else 0.0
-                    if relative_std < 0.01:  # Very low variance
+                    if relative_std <= max_relative_std:
                         findings.append(
                             Finding(
                                 satellite="MULTIPLE",
@@ -831,6 +852,8 @@ def detect_cross_satellite_correlations(
                                     "parameter": param,
                                     "satellite_count": len(values),
                                     "relative_std": relative_std,
+                                    "max_relative_std": max_relative_std,
+                                    "min_correlation": bounded_min_correlation,
                                     "satellites": [sat for sat, _ in values],
                                 },
                                 discovered_at=epoch,
@@ -850,6 +873,7 @@ def detect_transmission_time_anomalies(
     
     max_age_seconds = max_age_hours * 3600.0
     prev_transtime: Optional[float] = None
+    prev_transtime_absolute_gps_seconds: Optional[float] = None
     
     for record in records:
         transtime_value = _parse_transtime(record.values.get("TransTime"))
@@ -864,16 +888,18 @@ def detect_transmission_time_anomalies(
             # If GPSWeek is missing, we can't calculate absolute time, skip this check
             continue
         
-        # Convert TransTime from seconds-of-week to absolute GPS seconds
-        seconds_per_week = 604800  # 7 * 24 * 3600
-        transtime_absolute_gps_seconds = (gps_week * seconds_per_week) + transtime_value
-        
         # Calculate capture time in absolute GPS seconds
-        gps_epoch = datetime(1980, 1, 6, 0, 0, 0)
-        capture_gps_seconds = (record.epoch - gps_epoch).total_seconds()
-        
-        # Calculate age (how old the transmission time is)
-        transtime_age_seconds = abs(capture_gps_seconds - transtime_absolute_gps_seconds)
+        capture_gps_seconds = _gps_seconds_for_epoch(record.epoch)
+
+        (
+            transtime_absolute_gps_seconds,
+            aligned_week,
+            transtime_age_seconds,
+        ) = _resolve_absolute_gps_seconds(
+            sow_value=transtime_value,
+            gps_week=gps_week,
+            capture_gps_seconds=capture_gps_seconds,
+        )
         
         if transtime_age_seconds > max_age_seconds:
             findings.append(
@@ -889,6 +915,7 @@ def detect_transmission_time_anomalies(
                         "transtime_value": transtime_value,
                         "transtime_absolute_gps_seconds": transtime_absolute_gps_seconds,
                         "gps_week": gps_week,
+                        "aligned_gps_week": aligned_week,
                         "transtime_age_hours": transtime_age_seconds / 3600.0,
                         "max_age_hours": max_age_hours,
                         "capture_gps_seconds": capture_gps_seconds,
@@ -898,8 +925,11 @@ def detect_transmission_time_anomalies(
             )
         
         # Check for regression
-        if prev_transtime is not None:
-            if transtime_value < prev_transtime - 3600:  # More than 1 hour backward
+        if (
+            prev_transtime is not None
+            and prev_transtime_absolute_gps_seconds is not None
+        ):
+            if transtime_absolute_gps_seconds < prev_transtime_absolute_gps_seconds - 3600:
                 findings.append(
                     Finding(
                         satellite=satellite,
@@ -912,13 +942,23 @@ def detect_transmission_time_anomalies(
                         details={
                             "previous_transtime": prev_transtime,
                             "current_transtime": transtime_value,
-                            "regression_seconds": prev_transtime - transtime_value,
+                            "previous_transtime_absolute_gps_seconds": (
+                                prev_transtime_absolute_gps_seconds
+                            ),
+                            "current_transtime_absolute_gps_seconds": (
+                                transtime_absolute_gps_seconds
+                            ),
+                            "regression_seconds": (
+                                prev_transtime_absolute_gps_seconds
+                                - transtime_absolute_gps_seconds
+                            ),
                         },
                         discovered_at=record.epoch,
                     )
                 )
         
         prev_transtime = transtime_value
+        prev_transtime_absolute_gps_seconds = transtime_absolute_gps_seconds
     
     return findings
 
@@ -1132,3 +1172,37 @@ def _to_float(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
+
+def _gps_seconds_for_epoch(epoch: datetime) -> float:
+    """Convert a UTC datetime into absolute GPS seconds."""
+    return (epoch - GPS_EPOCH).total_seconds()
+
+
+def _resolve_absolute_gps_seconds(
+    sow_value: float,
+    gps_week: int,
+    capture_gps_seconds: float,
+) -> Tuple[float, int, float]:
+    """Resolve absolute GPS seconds from seconds-of-week with rollover tolerance."""
+    capture_week = int(capture_gps_seconds // SECONDS_PER_GPS_WEEK)
+    candidate_weeks = {
+        gps_week - 1,
+        gps_week,
+        gps_week + 1,
+        capture_week - 1,
+        capture_week,
+        capture_week + 1,
+    }
+
+    best_absolute = 0.0
+    best_week = gps_week
+    smallest_age = float("inf")
+    for week in candidate_weeks:
+        absolute = (week * SECONDS_PER_GPS_WEEK) + sow_value
+        age = abs(capture_gps_seconds - absolute)
+        if age < smallest_age:
+            smallest_age = age
+            best_absolute = absolute
+            best_week = week
+
+    return best_absolute, best_week, smallest_age

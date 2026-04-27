@@ -64,6 +64,21 @@ def test_single_satellite(base_epoch):
     assert len(findings) == 0
 
 
+def test_min_correlation_controls_sensitivity(base_epoch):
+    """Lower min_correlation should allow more variance before flagging."""
+    timeseries = {
+        "G01": [EpochRecord(epoch=base_epoch, values={"SVclockBias": 100.0}, source="source")],
+        "G02": [EpochRecord(epoch=base_epoch, values={"SVclockBias": 101.8}, source="source")],
+        "G03": [EpochRecord(epoch=base_epoch, values={"SVclockBias": 98.2}, source="source")],
+    }
+
+    strict_findings = detect_cross_satellite_correlations(timeseries, min_correlation=0.9)
+    relaxed_findings = detect_cross_satellite_correlations(timeseries, min_correlation=0.8)
+
+    assert len(strict_findings) == 0
+    assert len(relaxed_findings) > 0
+
+
 def test_finding_structure(base_epoch):
     """Test that findings have correct structure."""
     timeseries = {

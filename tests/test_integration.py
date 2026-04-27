@@ -18,6 +18,7 @@ def test_parse_args_defaults():
     assert args.max_ephemeris_age_hours == 4.0
     assert args.replay_sequence_length == 4
     assert args.enable_cross_satellite_checks is False
+    assert args.min_cross_satellite_correlation == 0.9
     assert args.disable_new_detections is False
 
 
@@ -35,6 +36,8 @@ def test_parse_args_with_options():
             "--replay-sequence-length",
             "6",
             "--enable-cross-satellite-checks",
+            "--min-cross-satellite-correlation",
+            "0.85",
             "--ignore-satellites",
             "G01",
             "G02",
@@ -45,6 +48,7 @@ def test_parse_args_with_options():
     assert args.max_ephemeris_age_hours == 5.0
     assert args.replay_sequence_length == 6
     assert args.enable_cross_satellite_checks is True
+    assert args.min_cross_satellite_correlation == 0.85
     assert args.ignore_satellites == ["G01", "G02"]
 
 
@@ -85,6 +89,42 @@ def test_run_detection_file_not_found(mock_load):
     
     with pytest.raises(FileNotFoundError):
         run_detection(args)
+
+
+@patch("spoof_detection.load_nav_json")
+def test_run_detection_stale_gap_not_flagged(mock_load):
+    """Ensure stale-data detection does not trigger when satellite has a gap."""
+    mock_load.return_value = {
+        "indexed_records": {
+            "by_time": {
+                "2025-11-10T00:00:00": {
+                    "satellites": {
+                        "G01": {"values": {"IODE": 10.0, "IODC": 10.0, "SVclockBias": -1.0e-4}},
+                    }
+                },
+                "2025-11-10T01:00:00": {
+                    "satellites": {
+                        "G99": {"values": {"IODE": 1.0, "IODC": 1.0}},
+                    }
+                },
+                "2025-11-10T03:30:00": {
+                    "satellites": {
+                        "G01": {"values": {"IODE": 10.0, "IODC": 10.0, "SVclockBias": -1.0e-4}},
+                    }
+                },
+            }
+        }
+    }
+
+    args = parse_args(["test.json", "--disable-new-detections"])
+    findings = run_detection(args)
+
+    stale_findings = [
+        finding
+        for finding in findings
+        if finding.satellite == "G01" and finding.code == "stale_data"
+    ]
+    assert stale_findings == []
 
 
 def test_finding_structure():

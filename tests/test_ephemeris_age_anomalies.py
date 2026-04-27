@@ -99,6 +99,29 @@ def test_missing_toe(base_epoch):
     assert len(findings) == 0
 
 
+def test_no_false_positive_with_adjacent_week_value(base_epoch):
+    """Toe age should tolerate an adjacent-week GPSWeek value near rollovers."""
+    gps_epoch = datetime(1980, 1, 6, 0, 0, 0)
+    seconds_per_week = 604800
+
+    epoch = base_epoch
+    capture_gps_seconds = (epoch - gps_epoch).total_seconds()
+    actual_gps_week = int(capture_gps_seconds // seconds_per_week)
+    toe_sow = capture_gps_seconds % seconds_per_week
+
+    # Simulate an off-by-one week in metadata.
+    records = [
+        EpochRecord(
+            epoch=epoch,
+            values={"Toe": toe_sow, "GPSWeek": actual_gps_week - 1},
+            source="source",
+        )
+    ]
+
+    findings = detect_ephemeris_age_anomalies(records, satellite="G01", max_age_hours=4.0)
+    assert not any(f.code == "ephemeris_age_anomaly" for f in findings)
+
+
 def test_finding_structure(base_epoch):
     """Test that findings have correct structure."""
     gps_epoch = datetime(1980, 1, 6, 0, 0, 0)

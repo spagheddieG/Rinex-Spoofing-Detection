@@ -6,10 +6,9 @@ import argparse
 from dataclasses import asdict
 from datetime import timedelta
 from pathlib import Path
-from typing import Iterable, List
+from typing import Any, Dict, Iterable, List
 
 from spoof_utils import (
-    EpochRecord,
     Finding,
     detect_cross_satellite_correlations,
     detect_ephemeris_age_anomalies,
@@ -22,7 +21,6 @@ from spoof_utils import (
     detect_temporal_source_inconsistencies,
     detect_transmission_time_anomalies,
     detect_unexpected_iod_changes,
-    extract_satellite_timeseries,
     extract_satellite_timeseries_multisource,
     load_nav_json,
 )
@@ -80,11 +78,64 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Enable cross-satellite correlation checks.",
     )
     parser.add_argument(
+        "--min-cross-satellite-correlation",
+        type=float,
+        default=0.9,
+        help=(
+            "Minimum cross-satellite correlation proxy score in [0, 1] "
+            "(higher values are stricter; default: 0.9)."
+        ),
+    )
+    parser.add_argument(
         "--disable-new-detections",
         action="store_true",
         help="Disable new highrate detection methods (use only original methods).",
     )
     return parser.parse_args(argv)
+
+
+def _extract_by_time_index(data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Extract a by-time index used for stale-data gap checks.
+
+    For single-source JSON, this returns ``indexed_records.by_time`` directly.
+    For multi-source JSON, this merges epochs and keeps a union of satellite
+    presence at each epoch to distinguish stale rebroadcasts from true gaps.
+    """
+    indexed_records = data.get("indexed_records")
+    if isinstance(indexed_records, dict):
+        by_time = indexed_records.get("by_time")
+        if isinstance(by_time, dict):
+            return by_time
+
+    merged_by_time: Dict[str, Dict[str, Any]] = {}
+    for source_data in data.values():
+        if not isinstance(source_data, dict):
+            continue
+        source_indexed = source_data.get("indexed_records")
+        if not isinstance(source_indexed, dict):
+            continue
+        source_by_time = source_indexed.get("by_time")
+        if not isinstance(source_by_time, dict):
+            continue
+
+        for epoch_str, entry in source_by_time.items():
+            if not isinstance(entry, dict):
+                continue
+            satellites = entry.get("satellites")
+            if not isinstance(satellites, dict):
+                continue
+
+            merged_entry = merged_by_time.setdefault(epoch_str, {"satellites": {}})
+            merged_satellites = merged_entry.setdefault("satellites", {})
+            if not isinstance(merged_satellites, dict):
+                merged_satellites = {}
+                merged_entry["satellites"] = merged_satellites
+
+            for sat, payload in satellites.items():
+                if sat not in merged_satellites:
+                    merged_satellites[sat] = payload if isinstance(payload, dict) else {}
+
+    return merged_by_time
 
 
 def run_detection(args: argparse.Namespace) -> List[Finding]:
@@ -93,6 +144,7 @@ def run_detection(args: argparse.Namespace) -> List[Finding]:
 
     # Extract timeseries, handling both single-source and multi-source files
     timeseries = extract_satellite_timeseries_multisource(data)
+    by_time_index = _extract_by_time_index(data)
 
     findings: List[Finding] = []
     ignore_set = {sat.upper() for sat in (args.ignore_satellites or [])}
@@ -114,7 +166,7 @@ def run_detection(args: argparse.Namespace) -> List[Finding]:
                 records,
                 satellite=satellite,
                 max_interval=max_interval,
-                by_time={},  # Not used in multi-source mode
+                by_time=by_time_index,
             )
         )
         findings.extend(detect_unexpected_iod_changes(records, satellite=satellite))
@@ -157,7 +209,10 @@ def run_detection(args: argparse.Namespace) -> List[Finding]:
 
     # Cross-satellite correlations (requires all timeseries)
     if not args.disable_new_detections and args.enable_cross_satellite_checks:
-        cross_satellite_findings = detect_cross_satellite_correlations(timeseries, min_correlation=0.9)
+        cross_satellite_findings = detect_cross_satellite_correlations(
+            timeseries,
+            min_correlation=args.min_cross_satellite_correlation,
+        )
         findings.extend(cross_satellite_findings)
 
     return findings
@@ -202,5 +257,4 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
-
 

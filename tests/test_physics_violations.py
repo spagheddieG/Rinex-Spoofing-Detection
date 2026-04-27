@@ -47,7 +47,7 @@ def test_finds_inclination_violation(base_epoch):
 def test_finds_iode_iodc_inconsistency(base_epoch):
     """Test that IODE/IODC inconsistencies are detected."""
     records = [
-        EpochRecord(epoch=base_epoch, values={"IODE": 10.0, "IODC": 266.0}, source="source"),  # Lower 8 bits don't match
+        EpochRecord(epoch=base_epoch, values={"IODE": 10.0, "IODC": 267.0}, source="source"),  # Lower 8 bits don't match
     ]
     findings = detect_physics_violations(records, satellite="G01")
     assert len(findings) > 0

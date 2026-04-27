@@ -104,6 +104,28 @@ def test_missing_transtime(base_epoch):
     assert len(findings) == 0
 
 
+def test_no_false_positive_with_adjacent_week_value(base_epoch):
+    """TransTime age should tolerate an adjacent-week GPSWeek value near rollovers."""
+    gps_epoch = datetime(1980, 1, 6, 0, 0, 0)
+    seconds_per_week = 604800
+
+    epoch = base_epoch
+    capture_gps_seconds = (epoch - gps_epoch).total_seconds()
+    actual_gps_week = int(capture_gps_seconds // seconds_per_week)
+    transtime_sow = capture_gps_seconds % seconds_per_week
+
+    records = [
+        EpochRecord(
+            epoch=epoch,
+            values={"TransTime": transtime_sow, "GPSWeek": actual_gps_week - 1},
+            source="source",
+        )
+    ]
+
+    findings = detect_transmission_time_anomalies(records, satellite="G01", max_age_hours=4.0)
+    assert not any(f.code == "transmission_time_anomaly" for f in findings)
+
+
 def test_finding_structure(base_epoch):
     """Test that findings have correct structure."""
     gps_epoch = datetime(1980, 1, 6, 0, 0, 0)

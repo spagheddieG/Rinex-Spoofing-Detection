@@ -135,7 +135,7 @@ def create_test_records() -> Dict[str, List[EpochRecord]]:
     
     # Physics violation
     physics_violation_records = [
-        EpochRecord(epoch=base_epoch, values={"Eccentricity": 1.5, "sqrtA": -1.0, "Io": 10.0, "IODE": 10.0, "IODC": 266.0}, source="source"),
+        EpochRecord(epoch=base_epoch, values={"Eccentricity": 1.5, "sqrtA": -1.0, "Io": 10.0, "IODE": 10.0, "IODC": 267.0}, source="source"),
     ]
     records["physics_violation"] = physics_violation_records
     
